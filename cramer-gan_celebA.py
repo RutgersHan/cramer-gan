@@ -58,21 +58,24 @@ def _compute_surrogate_loss(
 
 
 class CramerGAN(object):
-    def __init__(self, g_net, d_net, x_sampler, z_sampler, data, model, scale=10.0):
+    def __init__(self, g_net, d_net, train_sampler, val_sampler, z_sampler, data, model, save_dir, scale=10.0):
+        self.save_dir = save_dir
         self.model = model
         self.data = data
         self.d_net = d_net
         self.g_net = g_net
-        self.x_sampler = x_sampler
+        self.train_sampler = train_sampler
+        self.val_sampler = val_sampler
         self.z_sampler = z_sampler
         self.x_dim = d_net.x_dim
         self.z_dim = self.g_net.z_dim
-        self.x = tf.placeholder(tf.float32, [None, self.x_dim], name='x')
+
+        self.x = tf.placeholder(tf.float32, [None] + self.x_dim, name='x')
         self.z1 = tf.placeholder(tf.float32, [None, self.z_dim], name='z1')
         self.z2 = tf.placeholder(tf.float32, [None, self.z_dim], name='z2')
 
-        self.x1_ = self.g_net(self.z1, reuse=False)
-        self.x2_ = self.g_net(self.z2)
+        self.x1_ = self.g_net(self.x, self.z1, reuse=False)
+        self.x2_ = self.g_net(self.x, self.z2)
 
         h_real = d_net(self.x, reuse=False)
         h_generated1 = d_net(self.x1_)
@@ -123,15 +126,17 @@ class CramerGAN(object):
 
         ddx = tf.gradients(d_hat, x_hat)[0]
         print(ddx.get_shape().as_list())
-        ddx = tf.norm(ddx, axis=1)
+        # ddx = tf.norm(ddx, axis=1)
+        ddx = _safer_norm(ddx, axis=1)
         ddx = tf.reduce_mean(tf.square(ddx - 1.0) * scale)
+        self.ddx = ddx
 
-        self.d_loss = self.d_loss + ddx
+        self.d_loss_all = self.d_loss + self.ddx
 
         self.d_adam, self.g_adam = None, None
         with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
             self.d_adam = tf.train.AdamOptimizer(learning_rate=1e-4, beta1=0.5, beta2=0.9)\
-                .minimize(self.d_loss, var_list=self.d_net.vars)
+                .minimize(self.d_loss_all, var_list=self.d_net.vars)
             self.g_adam = tf.train.AdamOptimizer(learning_rate=1e-4, beta1=0.5, beta2=0.9)\
                 .minimize(self.g_loss, var_list=self.g_net.vars)
 
@@ -148,61 +153,75 @@ class CramerGAN(object):
             #     d_iters = 100
 
             for _ in range(0, d_iters):
-                bx = self.x_sampler(batch_size)
+                bx = self.train_sampler(batch_size)
                 bz1 = self.z_sampler(batch_size, self.z_dim)
                 bz2 = self.z_sampler(batch_size, self.z_dim)
-                self.sess.run(self.d_adam, feed_dict={self.x: bx, self.z1: bz1, self.z2: bz2})
-
-            bx = self.x_sampler(batch_size)
+                # self.sess.run(self.d_adam, feed_dict={self.x: bx, self.z1: bz1, self.z2: bz2})
+                _, d_loss, ddx = self.sess.run([self.d_adam, self.d_loss, self.ddx],
+                                               feed_dict={self.x: bx, self.z1: bz1, self.z2: bz2})
+                # print('d_loss', d_loss, 'ddx', ddx)
+            bx = self.train_sampler(batch_size)
             bz1 = self.z_sampler(batch_size, self.z_dim)
             bz2 = self.z_sampler(batch_size, self.z_dim)
-            self.sess.run(self.g_adam, feed_dict={self.z1: bz1, self.x: bx, self.z2: bz2})
+            _, g_loss = self.sess.run([self.g_adam, self.g_loss], feed_dict={self.z1: bz1, self.x: bx, self.z2: bz2})
+            # print('g_loss', g_loss)
 
             if t % 100 == 0:
-                bx = self.x_sampler(batch_size)
+                bx = self.train_sampler(batch_size)
                 bz1 = self.z_sampler(batch_size, self.z_dim)
                 bz2 = self.z_sampler(batch_size, self.z_dim)
 
-                d_loss = self.sess.run(
-                    self.d_loss, feed_dict={self.x: bx, self.z1: bz1, self.z2: bz2}
+                d_loss, ddx_loss = self.sess.run(
+                    [self.d_loss, self.ddx], feed_dict={self.x: bx, self.z1: bz1, self.z2: bz2}
                 )
                 g_loss = self.sess.run(
                     self.g_loss, feed_dict={self.z1: bz1, self.z2: bz2, self.x: bx}
                 )
-                print('Iter [%8d] Time [%5.4f] d_loss [%.4f] g_loss [%.4f]' %
-                        (t, time.time() - start_time, d_loss, g_loss))
+                print('Iter [%8d] Time [%5.4f] d_loss [%.4f] ddx_loss [%.4f] g_loss [%.4f]' %
+                        (t, time.time() - start_time, d_loss, ddx_loss, g_loss))
 
             if t % 100 == 0:
                 bz1 = self.z_sampler(batch_size, self.z_dim)
-                bx = self.sess.run(self.x1_, feed_dict={self.z1: bz1})
-                bx = xs.data2img(bx)
-                bx = grid_transform(bx, xs.shape)
-                imsave('./logs/{}/{}.png'.format(self.data, t/100), bx)
+                bx_train = self.train_sampler(batch_size)
+                bx_val = self.val_sampler(batch_size)
+
+                train_img = self.sess.run(self.x1_, feed_dict={self.z1: bz1,
+                                                               self.x: bx_train})
+                val_img = self.sess.run(self.x1_, feed_dict={self.z1: bz1,
+                                                             self.x: bx_val})
+                val_img = val_img[0:48]
+
+                img_tile_val = img_tile(val_img, tile_shape=[6, 8], aspect_ratio=1.0, border_color=1.0,
+                                             stretch=False)
+                save_tile_img(img_tile_val, os.path.join(self.save_dir, 'sample_val%d.png' % (t/100)))
+                img_tile_train = img_tile(train_img,  aspect_ratio=1.0, border_color=1.0,
+                                             stretch=False)
+                save_tile_img(img_tile_train, os.path.join(self.save_dir, 'sample%d.png' % (t/100)))
+
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('')
-    parser.add_argument('--data', type=str, default='mnist')
+    parser.add_argument('--data', type=str, default='celebA')
     parser.add_argument('--model', type=str, default='dcgan')
     parser.add_argument('--gpus', type=str, default='0')
-    parser.add_argument('--data_dir', type=str, default='/home/hanzhang/Data/celebA_total/celebA_processed')
     parser.add_argument('--save_dir', type=str, default='/home/hanzhang/Result/celebA_cramergan')
     args = parser.parse_args()
-    try:
-        os.makedirs('./logs/{}'.format(args.data))
-    except Exception:
-        print('./logs/{}'.format(args.data) + ' not created')
-        pass
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
-    # trainx = np.load(args.data_dir + '/celebA_64_train.npy')
-    # testx = np.load(args.data_dir + '/celebA_64_valid.npy')
+    args.save_dir = args.save_dir + '_' + args.gpus
 
+    try:
+        os.stat(args.save_dir)
+    except:
+        os.makedirs(args.save_dir)
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
 
     data = importlib.import_module(args.data)
     model = importlib.import_module(args.data + '.' + args.model)
-    xs = data.DataSampler()
+    train_sampler = data.TrainDataSampler()
+    val_sampler = data.ValDataSampler()
     zs = data.NoiseSampler()
     d_net = model.Discriminator()
     g_net = model.Generator()
-    cgan = CramerGAN(g_net, d_net, xs, zs, args.data, args.model)
+    cgan = CramerGAN(g_net, d_net, train_sampler, val_sampler, zs, args.data, args.model, args.save_dir)
     cgan.train()

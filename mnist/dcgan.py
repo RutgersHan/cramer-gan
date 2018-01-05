@@ -14,6 +14,7 @@ class Discriminator(object):
             if reuse:
                 vs.reuse_variables()
             bs = tf.shape(x)[0]
+            print(x.shape)
             x = tf.reshape(x, [bs, 28, 28, 1])
             conv1 = tf.layers.conv2d(x, 64, [4, 4], [2, 2])
             conv1 = leaky_relu(conv1)
